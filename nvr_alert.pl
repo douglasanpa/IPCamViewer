@@ -149,6 +149,7 @@ if ($size>0) {
 	&doExpire();
 }
 
+
 sub doExpire {
         if ($days_to_keep > 0)  {
                 $sta = $dbh->prepare("select id,image from images where DATE_SUB(NOW(),INTERVAL $days_to_keep DAY) > date");
@@ -156,9 +157,9 @@ sub doExpire {
                 while ($row=$sta->fetchrow_arrayref) {
                         if (-w "$loc/$row->[1]") {
                                 system("rm -f \"$loc/$row->[1]\"");
+                                $stb = $dbh->prepare("delete from images where id=?");
+                                $stb->execute($row->[0]) or print $DBI::errstr;
                         }
-                        $stb = $dbh->prepare("delete from images where id=?");
-                        $stb->execute($row->[0]) or print $DBI::errstr;
                 }
         }
 }
