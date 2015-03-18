@@ -1,43 +1,47 @@
 #!/usr/bin/perl
 
+# IPCamViewer 
+# https://github.com/bdwilson/IPCamViewer
+#
+
 use File::Basename;
 use File::Find;
 use File::stat;
 use Date::Manip;
-use Time::localtime;
+#use Time::localtime;
 use LWP::UserAgent;
 use Astro::Sunrise;
 use Data::Dumper;
+use Config::Simple;
 use DBI;
 
-# set to be lat and long of your location to correctly compute the
-# sunrise/sunset
-$lat="37.3318";
-$long="122.0312";
-# Set to be the base location of where images should be looked for.
-# This is assuming that within this directory you have subdirectories for each
-# camera (i.e. Front_Door, Back_Door, etc.) and that your camera is configured
-# to save the pictures to the proper subdirectory via FTP.
-$loc = "/storage/samba/Pictures/NVR";
+# Location of your config file.
+$config = "/etc/nvr_alert.cfg";
 # Assuming all images uploaded are .jpg files
 $extensions =  qw'\.jpg';
-# number of minutes to suppress alerts around sunrise/sunset when IR sensor changes; this is
-# in both directions; so X minutes before and X minutes after sunrise/sunset
-$false_mins = "20";
-# days of images to keep. script needs to be run as an id that has permissions
-# to remove the files. set to 0 if you want to keep them forever.
-$days_to_keep="30";
-# URL of the PHP file. 
-$url="http://myraspberrypiwebserver.homenet.org/cam/index.php";
-# don't send events within x mins of each other.
-$max_notify_interval="10"; 
-# Database info.  This should match config.php
-# Database schema should be included. 
-$database="cam";
-$hostname="localhost";
-$username="cam";
-$password="cam";
-###
+
+######### Shouldn't need to go down here ####
+if (!-f "$config") {
+	print "Please create a config file from the sample and put it here: $config\n";
+	exit;
+}
+
+$c = new Config::Simple($config);
+$lat=$c->param('options.lat');
+$long=$c->param('options.long');
+$loc=$c->param('options.ftpdir');
+$false_mins=$c->param('options.false_mins');
+$days_to_keep=$c->param('options.days_to_keep');
+$url=$c->param('options.url');
+$logfile=$c->param('options.log');
+$max_notify_interval=$c->param('options.max_notify_interval');
+$geo_ignore_interval=$c->param('geohopper.geo_ignore_interval');
+$geo_enable=$c->param('geohopper.enable');
+$ignore_for_all=$c->param('geohopper.ignore_for_all');
+$database=$c->param('mysql.database');
+$hostname=$c->param('mysql.hostname');
+$username=$c->param('mysql.username');
+$password=$c->param('mysql.password');
 
 $data_source= "DBI:mysql:database=$database;host=$hostname;port=3306";
 $dbh = DBI->connect($data_source, $username, $password) ||
@@ -54,7 +58,7 @@ $sta->execute or print $DBI::errstr;
 $count=$sta->fetchrow;
 
 if ($count>0) {
-	# if we have images, load up the users
+	# if we have images, load up the users who qualify for alerts
 	if ($max_notify_interval > 0) {
 		$q="select * from users where DATE_SUB(NOW(),INTERVAL $max_notify_interval MINUTE) > lastNotify";
 	} else {
@@ -69,7 +73,7 @@ if ($count>0) {
 if ($size>0) {
 	# if we have users to notify...
 	$date = &ParseDate("now");
-	$hour = &UnixDate($date,"%H"); 
+	#$hour = &UnixDate($date,"%H"); 
 	$sunrise = sun_rise($long,$lat);
 	$sunset = sun_set($long,$lat);
 	$sunrise_d= ParseDate($sunrise);
@@ -79,20 +83,42 @@ if ($size>0) {
 	$delta = DateCalc($sunset_d,$date);
 	$minutes_ss= Delta_Format($delta,1,"%mt");
 
+	# Check sunrise/sunset offsets
 	$skip=0;
-	#print "$hour\n";
 	&checkFalseAlarm($minutes_sr);
 	&checkFalseAlarm($minutes_ss);
 
-	#$count = $count/2;
+	# Find out if any users are home
+	$isHome=0;
+	$homeCount=0;
+	foreach $user (keys %$users) {
+		if ($users->{$user}{'isHome'}) {
+			$isHome=1;
+			$homeCount++;
+		}
+	}
+
+	# Do geoLocation based suppression for ALL users if 1 user just
+	# left/arrived within $geo_ignore_interval. Requires Geohopper.
+	if ($ignore_for_all && $geo_enable) {
+		$sta = $dbh->prepare("select count(user) from users where DATE_SUB(NOW(),INTERVAL $geo_ignore_interval MINUTE) < homeTime");
+		$sta->execute or print $DBI::errstr;
+		$igcount=$sta->fetchrow;
+		if ($igcount>0) {
+			$skip=1;
+			$ignore="geoLocation ignore $igcount users arrived/left within $geo_ignore_interval mins";
+		}
+	}
+
+	# Process per-camera ignore/suppression times
         $stb=$dbh->prepare("select distinct(location) from images where notified=0");
         $stb->execute or print $DBI::errstr;
 	while($location = $stb->fetchrow_array) {
 		$locations{$location}++; 
-		$stc=$dbh->prepare("select ignore_ranges from cameras where location=?");
+		$stc=$dbh->prepare("select ignore_ranges,ignoreHome,ignoreAway from cameras where location=?");
 		$stc->execute($location) or print $DBI::errstr;
-		while(my $range = $stc->fetchrow_array) {
-			my (@ranges)=split(/\,/,$range);
+		while(my $row = $stc->fetchrow_arrayref) {
+			my (@ranges)=split(/\,/,$row->[0]);
 			foreach my $t_slice (@ranges) {
 				my ($s,$e)=split(/\-/,$t_slice);
 				my $ret = &checkRange($s,$e);
@@ -102,8 +128,21 @@ if ($size>0) {
 				}
 			}
 		}
+		# process cameras set to ignore if at least 1 user is home
+		if ($row->[1] && $isHome) {
+			$locations{$location}--;
+			$ignore="found ignore if home for $location";
+		}
+		# process cameras set to ignore if nobody is at home
+		if ($row->[2] && $isHome == 0) {
+			$locations{$location}--;
+			$ignore="found ignore if away for $location";
+		}
+			
 	}
 
+	# are there any locations left to process after going through
+	# ignore/suppression routines
 	$loc_count=0;
 	foreach $location (keys %locations) {
 		if ($locations{$location} eq 1) {
@@ -114,7 +153,13 @@ if ($size>0) {
 
 	chop($loc_string);
 	chop($loc_string);
-		
+
+	$sta = $dbh->prepare("select max(eventId) from images");
+	$sta->execute or print $DBI::errstr;
+	$eventId=$sta->fetchrow;
+	$eventId=$eventId+1;
+
+	# if we have locations with alerts and no alerts skipped..
 	if (!$skip && $loc_count > 0) {
 		$sta = $dbh->prepare("delete from suppress where expiration < NOW()");
 		$sta->execute or print $DBI::errstr;
@@ -123,32 +168,34 @@ if ($size>0) {
 		while ($row=$sta->fetchrow_arrayref) {
 			$suppress{$row->[0]}++;
 		}
+
+		# do per-User geoLocation blocking if configured; person who
+		# didn't enter/exit still gets notified.
+		if (!$ignore_for_all && $geo_enable) {
+			$sta = $dbh->prepare("select authkey from users where DATE_SUB(NOW(),INTERVAL $geo_ignore_interval MINUTE) < homeTime");
+			$sta->execute or print $DBI::errstr;
+			while ($row=$sta->fetchrow_arrayref) {
+				$suppress{$row->[0]}++;
+			}
+		}
+
+		# process each available user
 		foreach $user (keys %$users) {
 			if (!$suppress{$users->{$user}{'authkey'}} && $users->{$user}{'enabled'}) {
-				if (($hour > 21) || ($hour < 6)) { 
-					$link = "$url?time=half&auth=$users->{$user}{'authkey'}";
-				} else {
-					$link = "$url?&auth=$users->{$user}{'authkey'}";
-				}
-				
+				$link = "$url?event=$eventId&auth=$users->{$user}{'authkey'}";
 				$sta = $dbh->prepare("update users set lastNotify=NOW() where user=?");
 				$sta->execute($user) or print $DBI::errstr;
-				print "Notifying $user for $count $link\n";
-				&pushover($users->{$user}{'pushoverApp'},$users->{$user}{'pushoverKey'},"$loc_string","$count video event(s) for $loc_string the past few minutes, please review alerts: $link","$link");
-			#} else {
-				#print "Skipping for $user\n";
+				&log("$count video event(s) for $loc_string the past few minutes, $homeCount user(s) at home, please review alerts. $link");
+				&pushover($users->{$user}{'pushoverApp'},$users->{$user}{'pushoverKey'},"$loc_string","$count video event(s) for $loc_string the past few minutes, $homeCount user(s) at home, please review alerts.","$link");
 			}
 		}
 	} else {
-		$string = "I suppressed an alert $minutes_sr $minutes_ss ($ignore)$ link\n";
-		# uncomment  and add your pushover App ID and pushover API key to debug suppressed alerts
-		#&pushover("PushOverAPPID","PushOverAPIKey","","$string","$link");
+		&log("DEBUG: I suppressed an alert $minutes_sr $minutes_ss ($ignore) $homeCount users at home. $url?event=$eventId&auth=bAnBuXhAhAXaDuX");
 	}
-	$sta = $dbh->prepare("update images set notified=1 where notified=0");
-	$sta->execute or print $DBI::errstr;
+	$sta = $dbh->prepare("update images set notified=1,eventId=? where notified=0");
+	$sta->execute($eventId) or print $DBI::errstr;
 	&doExpire();
 }
-
 
 sub doExpire {
         if ($days_to_keep > 0)  {
@@ -244,6 +291,18 @@ sub findfiles {
   $subdir =~ s/\_/ /g;
   return if ($files->{$basefile});
   my $st = stat($full);
-  $sta = $dbh->prepare("insert into images VALUES(\"\",?,FROM_UNIXTIME(?),?,0)");
+  $sta = $dbh->prepare("insert into images VALUES(\"\",?,FROM_UNIXTIME(?),?,0,0)");
   $sta->execute($basefile,$st->mtime,$subdir) or print $DBI::errstr;
+}
+
+sub log {
+  my $entry=shift;
+  if ($logfile) {
+  	open(LOG, ">>$logfile");
+  	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)=localtime(time);
+  	my $timestamp = sprintf ("%04d%02d%02d %02d:%02d:%02d",
+                           $year+1900,$mon+1,$mday,$hour,$min,$sec);
+  	print LOG "[$timestamp] $entry\n";
+  	close(LOG);
+  } 
 }
