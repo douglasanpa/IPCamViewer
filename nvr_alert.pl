@@ -53,7 +53,7 @@ $files=$sta->fetchall_hashref("image");
 
 find(\&findfiles,$loc);
 
-$sta = $dbh->prepare("select count(id) from images where notified=0");
+$sta = $dbh->prepare("select count(id) from images where eventId=0");
 $sta->execute or print $DBI::errstr;
 $count=$sta->fetchrow;
 
@@ -85,6 +85,7 @@ if ($size>0) {
 
 	# Check sunrise/sunset offsets
 	$skip=0;
+	$notified=0;
 	&checkFalseAlarm($minutes_sr);
 	&checkFalseAlarm($minutes_ss);
 
@@ -111,7 +112,7 @@ if ($size>0) {
 	}
 
 	# Process per-camera ignore/suppression times
-        $stb=$dbh->prepare("select distinct(location) from images where notified=0");
+        $stb=$dbh->prepare("select distinct(location) from images where eventId=0");
         $stb->execute or print $DBI::errstr;
 	while($location = $stb->fetchrow_array) {
 		$locations{$location}++; 
@@ -187,13 +188,14 @@ if ($size>0) {
 				$sta->execute($user) or print $DBI::errstr;
 				&log("$count video event(s) for $loc_string the past few minutes, $homeCount user(s) at home, please review alerts. $link");
 				&pushover($users->{$user}{'pushoverApp'},$users->{$user}{'pushoverKey'},"$loc_string","$count video event(s) for $loc_string the past few minutes, $homeCount user(s) at home, please review alerts.","$link");
+				$notified++;
 			}
 		}
 	} else {
 		&log("DEBUG: I suppressed an alert $minutes_sr $minutes_ss ($ignore) $homeCount users at home. $url?event=$eventId&auth=bAnBuXhAhAXaDuX");
 	}
-	$sta = $dbh->prepare("update images set notified=1,eventId=? where notified=0");
-	$sta->execute($eventId) or print $DBI::errstr;
+	$sta = $dbh->prepare("update images set notified=?,eventId=? where eventId=0");
+	$sta->execute($notified,$eventId) or print $DBI::errstr;
 	&doExpire();
 }
 
